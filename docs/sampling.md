@@ -346,3 +346,37 @@ labels retain their codes (for example, `ZN`); unknown or non-CCD labels use
 `LIG`. Multi-residue non-polymer chains retain their per-residue CCD labels.
 When mapping that CIF back to the same `System` with `map_cif_atom_order()`,
 BioEmu2 matches `LIG` to the internal `UNK` label for SMILES/InChI ligands.
+
+## Sample an equilibrium ensemble around a template
+
+BioEmu2's trunk has no structural-template input. To use a known structure, such
+as a designed complex, as a template for equilibrium sampling, start the
+denoising from it: `sample_equilibrium_from_template()` embeds the system in
+equilibrium mode (with the MSA you pass, for example a local alignment for a
+designed chain), noises the template to `start_sigma` angstroms, and runs the
+rest of the equilibrium schedule. There is no dynamics conditioning and no lag.
+Small `start_sigma` keeps samples near the template; the full schedule starts
+at 2560 Å, which is ordinary equilibrium sampling.
+
+```python
+from bioemu2 import get_msa, load_model, sample_equilibrium_from_template
+
+msa = get_msa(system, source={"A": Path("target.a3m"), "B": Path("binder.a3m")})
+samples = sample_equilibrium_from_template(
+    system,
+    model=load_model(),
+    template="designed_complex.cif",
+    start_sigma=20.0,
+    num_samples=32,
+    msa=msa,
+    sampler="edm_gd",
+    seed=0,
+)
+```
+
+`EmuSession.sample_from_template()` does the same with a session's embeddings,
+and the `EDMSampler` and `GuidedFKSampler` field `start_sigma` exposes it for
+custom samplers (the template goes in `batch.coords`). On the command line, add
+`--template-cif`, `--template-sigma` and, per protein chain, `--msa CHAIN=A3M`
+to `sample-equilibrium` (samplers `edm` and `edm_gd`).
+

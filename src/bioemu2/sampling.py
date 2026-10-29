@@ -1,5 +1,6 @@
 """Structure prediction and equilibrium sampling with physicality filtering."""
 
+import dataclasses
 import logging
 import shutil
 from collections import Counter
@@ -17,11 +18,12 @@ from tqdm.auto import trange
 from bioemu2.biomoa.models.score_model import TrunkEmbeddings
 from bioemu2.conditioning.method import SamplingMode
 from bioemu2.data_interface import Contact, System
+from bioemu2.denoising.rigid_align import weighted_rigid_align
 from bioemu2.denoising.samplers import EDMSampler, FKCSampler, GuidedFKSampler, Sampler
 from bioemu2.denoising.steering.feats import Tracker
 from bioemu2.denoising.steering.potentials import Potential
 from bioemu2.model import InferenceModel
-from bioemu2.msa.alignment import get_msa
+from bioemu2.msa.alignment import MSA, get_msa
 from bioemu2.physicality import (
     PhysicalityFilterMode,
     PhysicalityReport,
@@ -37,7 +39,11 @@ from bioemu2.structure import (
 )
 from bioemu2.structure.cif import save_structure_to_cif
 from bioemu2.structure.preparation import prepare_sampling_inputs
-from bioemu2.trajectory_io import coords_angstrom_to_trajectory
+from bioemu2.trajectory_io import (
+    coords_angstrom_to_trajectory,
+    map_cif_atom_order,
+    trajectory_to_coords_angstrom,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +369,130 @@ def sample_with_embeddings(
         )
     trajectory = coords_angstrom_to_trajectory(coords, topology)
     return trajectory
+
+
+def sample_from_template_with_embeddings(
+    system: System,
+    trunk_embeddings: TrunkEmbeddings,
+    *,
+    template: mdtraj.Trajectory,
+    start_sigma: float,
+    model: InferenceModel[TrunkEmbeddings],
+    num_samples: int = 8,
+    batch_size: int | None = None,
+    sampler: EDMSampler | GuidedFKSampler,
+    seed: int | None = None,
+    progress: bool = True,
+) -> mdtraj.Trajectory:
+    """Equilibrium samples around a template by partial diffusion.
+
+    No dynamics conditioning and no lag: the template is noised to ``start_sigma``
+    (angstroms) and denoised by the equilibrium score model along the rest of the
+    schedule. Small ``start_sigma`` keeps samples near the template; at the full
+    schedule's maximum it is ordinary equilibrium sampling. Samples are superposed on
+    the template.
+
+    Args:
+        system: Molecular system represented by ``trunk_embeddings`` (equilibrium mode).
+        trunk_embeddings: Reusable output from ``model.embed``.
+        template: One structure with the system's topology.
+        start_sigma: Starting noise level in angstroms.
+        model: Inference model used to create the embeddings and denoise structures.
+        num_samples: Number of output conformations.
+        batch_size: Maximum samples generated per denoising call.
+        sampler: ``EDMSampler`` or ``GuidedFKSampler``; its ``start_sigma`` is replaced.
+        seed: Optional Torch random seed.
+        progress: Whether to display sampling progress.
+
+    Returns:
+        Samples superposed on the template, in nanometers.
+    """
+    if template.n_frames != 1:
+        raise ValueError("template must be a single frame.")
+    if not isinstance(sampler, EDMSampler | GuidedFKSampler):
+        raise ValueError("Template sampling supports EDMSampler and GuidedFKSampler.")
+    sampler = dataclasses.replace(sampler, start_sigma=start_sigma)
+    if batch_size is None:
+        batch_size = num_samples
+    topology, batch = prepare_sampling_inputs(system, device=model.device)
+    if template.topology != topology:
+        raise ValueError("template topology must exactly match the system topology.")
+    xyz = trajectory_to_coords_angstrom(template, device=model.device, dtype=torch.float32)
+    if not torch.isfinite(xyz).all():
+        raise ValueError("template coordinates must be finite.")
+    coords = xyz.new_zeros(1, batch.atom_pad_mask.shape[1], 3)
+    coords[:, : topology.n_atoms] = xyz - xyz.mean(dim=1, keepdim=True)
+    batch = batch.replace(coords=coords)
+    warn_batch_size(int(batch.num_tokens.item()), num_samples, batch_size)
+    with rng_seed(seed):
+        sampled = generate_samples(
+            num_samples=num_samples,
+            batch_size=batch_size,
+            score_model=model,
+            sampler=sampler,
+            num_atoms=topology.n_atoms,
+            system=system,
+            batch=batch,
+            trunk_embeddings=trunk_embeddings,
+            progress=progress,
+            seed=seed,
+        )
+    trajectory = coords_angstrom_to_trajectory(sampled, topology)
+    mask = torch.ones(trajectory.xyz.shape[:2])
+    aligned, _, _ = weighted_rigid_align(
+        torch.as_tensor(trajectory.xyz),
+        torch.as_tensor(template.xyz).repeat(trajectory.n_frames, 1, 1),
+        mask,
+        mask,
+    )
+    trajectory.xyz = aligned.numpy()
+    return trajectory
+
+
+def sample_equilibrium_from_template(
+    system: System,
+    *,
+    model: InferenceModel[TrunkEmbeddings],
+    template: mdtraj.Trajectory | str | Path,
+    start_sigma: float,
+    num_samples: int = 8,
+    msa: MSA | None = None,
+    contacts: list[Contact] | None = None,
+    batch_size: int | None = None,
+    sampler: Literal["edm", "edm_gd"] | EDMSampler | GuidedFKSampler = "edm",
+    seed: int | None = None,
+    progress: bool = True,
+) -> mdtraj.Trajectory:
+    """Equilibrium sampling with a structural template, by partial diffusion.
+
+    BioEmu2's trunk has no structural-template input. This embeds the system in
+    equilibrium mode with ``msa`` (default: ``get_msa(system)``, e.g. per-chain local
+    A3M files via ``get_msa(system, source={...})``) and denoises the template from
+    ``start_sigma`` angstroms (see ``sample_from_template_with_embeddings``).
+    """
+    if isinstance(template, str | Path):
+        template = map_cif_atom_order(system, template)
+    configured = (
+        sampler_from_preset(sampler, mode="equilibrium") if isinstance(sampler, str) else sampler
+    )
+    trunk_embeddings = model.embed(
+        system,
+        msa=msa if msa is not None else get_msa(system),
+        mode="equilibrium",
+        contacts=contacts,
+    )
+    return sample_from_template_with_embeddings(
+        system,
+        trunk_embeddings,
+        template=template,
+        start_sigma=start_sigma,
+        model=model,
+        num_samples=num_samples,
+        batch_size=batch_size,
+        sampler=configured,  # type: ignore[arg-type]
+        seed=seed,
+        progress=progress,
+    )
 
 
 def _embed_and_sample(

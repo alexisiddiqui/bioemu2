@@ -1,4 +1,4 @@
-"""Template-conditioned equilibrium sampling: per-frame lags through the propagation pathway."""
+"""Equilibrium sampling around a template by partial diffusion, and per-frame propagation lags."""
 
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 import torch
 
-import bioemu2.propagation as inference_api
+import bioemu2.propagation as propagation_api
+import bioemu2.sampling as sampling_api
 from bioemu2 import EDMSampler, GuidedFKSampler, propagate_with_embeddings
 from bioemu2.biomoa.models.score_model import TrunkEmbeddings
-from bioemu2.propagation import sample_from_template_with_embeddings, template_lag_times
+from bioemu2.denoising.edm import edm_sample_schedule, initial_coords, truncate_schedule
+from bioemu2.sampling import sample_from_template_with_embeddings
 from bioemu2.structure import BatchAllAtomStructure
 
 
@@ -23,58 +25,106 @@ def _three_atom_topology() -> mdtraj.Topology:
     return topology
 
 
-def _setup(monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]):
+def _fakes(monkeypatch: pytest.MonkeyPatch, module: Any, calls: list[dict[str, Any]], sample):
     topology = _three_atom_topology()
     batch = BatchAllAtomStructure(
+        coords=torch.zeros(1, 4, 3),
         coords_cond=torch.zeros(1, 4, 3),
         is_dynamics_conditioned=torch.zeros(1, 1, dtype=torch.bool),
         dt=torch.zeros(1, 1),
         atom_pad_mask=torch.ones(1, 4, dtype=torch.bool),
+        num_tokens=torch.tensor([1]),
     )
 
-    def sample(**kwargs: Any) -> torch.Tensor:
+    def fake(**kwargs: Any) -> torch.Tensor:
         calls.append(kwargs)
-        return kwargs["batch"].coords_cond[:, :3]
+        return sample(kwargs)
 
-    monkeypatch.setattr(inference_api, "generate_samples", sample)
-    monkeypatch.setattr(
-        inference_api, "prepare_sampling_inputs", lambda *_args, **_kwargs: (topology, batch)
-    )
+    monkeypatch.setattr(module, "generate_samples", fake)
+    monkeypatch.setattr(module, "prepare_sampling_inputs", lambda *_a, **_k: (topology, batch))
     system: Any = SimpleNamespace(topology=topology, bonds=[])
     model: Any = SimpleNamespace(device=torch.device("cpu"), supports_propagation=True)
     template = mdtraj.Trajectory(
-        xyz=np.array([[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.2, 0.0]]], dtype=np.float32),
+        xyz=np.array([[[1.0, 0.0, 0.0], [1.1, 0.0, 0.0], [1.0, 0.2, 0.0]]], dtype=np.float32),
         topology=topology,
     )
     return system, cast(TrunkEmbeddings, SimpleNamespace()), model, template
 
 
-def test_template_lag_times_fixed_and_log_uniform() -> None:
-    np.testing.assert_array_equal(template_lag_times(3, 10.0), [10.0, 10.0, 10.0])
-    lags = template_lag_times(2000, 10.0, 1e5, seed=0)
-    assert lags.min() >= 10.0 and lags.max() <= 1e5
-    # Log-uniform: half the draws fall below the geometric midpoint (1000 ns).
-    assert abs((lags < 1000.0).mean() - 0.5) < 0.05
-    np.testing.assert_array_equal(lags, template_lag_times(2000, 10.0, 1e5, seed=0))
+def test_truncate_schedule_keeps_levels_at_or_below_start() -> None:
+    sigmas = edm_sample_schedule(200, device=torch.device("cpu"))
+    assert torch.equal(truncate_schedule(sigmas, None), sigmas)
+    kept = truncate_schedule(sigmas, 20.0)
+    assert kept[0] <= 20.0 and kept[-1] == 0.0 and len(kept) < len(sigmas)
+    torch.testing.assert_close(kept, sigmas[sigmas <= 20.0])
+    with pytest.raises(ValueError, match="start_sigma"):
+        truncate_schedule(sigmas, 1e-9)
+    with pytest.raises(ValueError, match="start_sigma"):
+        truncate_schedule(sigmas, -1.0)
 
 
-@pytest.mark.parametrize(
-    ("args", "error"),
-    [
-        ((0, 1.0), "num_samples"),
-        ((2, 0.0), "lag_time_ns"),
-        ((2, 10.0, 1.0), "max_lag_time_ns"),
-        ((2, 10.0, float("inf")), "max_lag_time_ns"),
-    ],
-)
-def test_template_lag_times_validates(args: tuple, error: str) -> None:
-    with pytest.raises(ValueError, match=error):
-        template_lag_times(*args)
+def test_initial_coords_start_from_template_plus_noise() -> None:
+    template = torch.arange(6.0).reshape(1, 2, 3)
+    torch.manual_seed(0)
+    noise = initial_coords(template, torch.tensor(2.0), None, torch.randn)
+    torch.manual_seed(0)
+    started = initial_coords(template, torch.tensor(2.0), 2.0, torch.randn)
+    torch.testing.assert_close(started, template + noise)
+
+
+def test_samplers_validate_start_sigma() -> None:
+    assert EDMSampler(start_sigma=10.0).start_sigma == 10.0
+    with pytest.raises(ValueError, match="start_sigma"):
+        EDMSampler(start_sigma=0.0)
+    with pytest.raises(ValueError, match="start_sigma"):
+        GuidedFKSampler(start_sigma=float("nan"))
+
+
+def test_sample_from_template_noises_the_template(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+    rotation = torch.tensor([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    system, trunk, model, template = _fakes(
+        monkeypatch,
+        sampling_api,
+        calls,
+        lambda kw: kw["batch"].coords[:, :3].repeat(kw["num_samples"], 1, 1) @ rotation,
+    )
+    samples = sample_from_template_with_embeddings(
+        system,
+        trunk,
+        template=template,
+        start_sigma=15.0,
+        model=model,
+        num_samples=3,
+        sampler=EDMSampler(),
+        seed=1,
+    )
+    (call,) = calls
+    assert call["sampler"].start_sigma == 15.0 and isinstance(call["sampler"], EDMSampler)
+    # The template, centred and padded, is the starting point; no dynamics conditioning.
+    centred = 10 * (template.xyz[0] - template.xyz[0].mean(axis=0))
+    torch.testing.assert_close(call["batch"].coords[0, :3], torch.as_tensor(centred))
+    assert call["batch"].coords[0, 3].abs().sum() == 0
+    assert not bool(call["batch"].is_dynamics_conditioned.any())
+    # Samples are superposed back on the template.
+    assert samples.n_frames == 3
+    np.testing.assert_allclose(samples.xyz, np.repeat(template.xyz, 3, axis=0), atol=1e-5)
+    with pytest.raises(ValueError, match="EDMSampler and GuidedFKSampler"):
+        sample_from_template_with_embeddings(
+            system,
+            trunk,
+            template=template,
+            start_sigma=15.0,
+            model=model,
+            sampler=cast(Any, SimpleNamespace()),
+        )
 
 
 def test_propagate_takes_one_lag_per_frame(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
-    system, trunk, model, template = _setup(monkeypatch, calls)
+    system, trunk, model, template = _fakes(
+        monkeypatch, propagation_api, calls, lambda kw: kw["batch"].coords_cond[:, :3]
+    )
     propagate_with_embeddings(
         system,
         trunk,
@@ -89,36 +139,4 @@ def test_propagate_takes_one_lag_per_frame(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(ValueError, match="one lag per x0 frame"):
         propagate_with_embeddings(
             system, trunk, x0=template[[0, 0]], lag_time_ns=[1.0], model=model, sampler=EDMSampler()
-        )
-
-
-def test_sample_from_template_records_lags_and_rejects_resampling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict[str, Any]] = []
-    system, trunk, model, template = _setup(monkeypatch, calls)
-    samples = sample_from_template_with_embeddings(
-        system,
-        trunk,
-        template=template,
-        num_samples=5,
-        lag_time_ns=10.0,
-        max_lag_time_ns=1e4,
-        model=model,
-        sampler=EDMSampler(),
-        seed=3,
-    )
-    assert samples.n_frames == 5
-    np.testing.assert_allclose(samples.time, template_lag_times(5, 10.0, 1e4, seed=3) * 1000.0)
-    assert all(bool(c["batch"].is_dynamics_conditioned.all()) for c in calls)
-    with pytest.raises(ValueError, match="Resampling samplers mix particles across lags"):
-        sample_from_template_with_embeddings(
-            system,
-            trunk,
-            template=template,
-            num_samples=4,
-            lag_time_ns=10.0,
-            max_lag_time_ns=1e4,
-            model=model,
-            sampler=GuidedFKSampler(resampling_interval=1),
         )

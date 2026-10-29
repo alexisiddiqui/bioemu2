@@ -16,11 +16,15 @@ from bioemu2.model import InferenceModel
 from bioemu2.structure import BatchAllAtomStructure
 
 
-def _validate_edm_scales(step_scale: float, noise_scale: float) -> None:
+def _validate_edm_scales(
+    step_scale: float, noise_scale: float, start_sigma: float | None = None
+) -> None:
     if not math.isfinite(step_scale) or step_scale <= 0:
         raise ValueError("step_scale must be finite and positive.")
     if not math.isfinite(noise_scale) or noise_scale < 0:
         raise ValueError("noise_scale must be finite and nonnegative.")
+    if start_sigma is not None and (not math.isfinite(start_sigma) or start_sigma <= 0):
+        raise ValueError("start_sigma must be finite and positive.")
 
 
 @dataclass(kw_only=True)
@@ -49,14 +53,19 @@ class Sampler(ABC):
 
 @dataclass(kw_only=True)
 class EDMSampler(Sampler):
-    """Unsteered EDM sampler backed by ``edm_sampler``."""
+    """Unsteered EDM sampler backed by ``edm_sampler``.
+
+    ``start_sigma`` (angstroms) turns on partial diffusion: denoising starts from the
+    template in ``batch.coords`` noised to that level, running only the steps below it.
+    """
 
     num_steps: int = 200
     step_scale: float = 1.0
     noise_scale: float = 1.0
+    start_sigma: float | None = None
 
     def __post_init__(self) -> None:
-        _validate_edm_scales(self.step_scale, self.noise_scale)
+        _validate_edm_scales(self.step_scale, self.noise_scale, self.start_sigma)
 
     def __call__(
         self,
@@ -104,9 +113,10 @@ class GuidedFKSampler(Sampler):
     resampling_group_size: int | None = None
     fk_lambda: float = 4.0
     num_gd_steps: int = 20
+    start_sigma: float | None = None
 
     def __post_init__(self) -> None:
-        _validate_edm_scales(self.step_scale, self.noise_scale)
+        _validate_edm_scales(self.step_scale, self.noise_scale, self.start_sigma)
 
     def __call__(
         self,

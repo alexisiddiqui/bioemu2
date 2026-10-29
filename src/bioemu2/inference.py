@@ -13,8 +13,13 @@ from bioemu2.denoising.samplers import EDMSampler, GuidedFKSampler, Sampler
 from bioemu2.embedding_cache import contacts_digest, msa_digest, system_digest
 from bioemu2.model import InferenceModel, _InferenceModel
 from bioemu2.msa.alignment import MSA, get_msa
-from bioemu2.propagation import propagate_with_embeddings, sample_from_template_with_embeddings
-from bioemu2.sampling import SamplerPreset, sample_with_embeddings, sampler_from_preset
+from bioemu2.propagation import propagate_with_embeddings
+from bioemu2.sampling import (
+    SamplerPreset,
+    sample_from_template_with_embeddings,
+    sample_with_embeddings,
+    sampler_from_preset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,41 +203,38 @@ class EmuSession:
     def sample_from_template(
         self,
         template: mdtraj.Trajectory,
-        num_samples: int,
+        num_samples: int = 8,
         *,
-        lag_time_ns: float,
-        max_lag_time_ns: float | None = None,
+        start_sigma: float,
         batch_size: int | None = None,
         sampler: SamplerPreset | Sampler = "edm",
         seed: int | None = None,
         progress: bool = True,
     ) -> mdtraj.Trajectory:
-        """Template-conditioned equilibrium samples (see ``sample_equilibrium_from_template``).
+        """Equilibrium samples around ``template`` by partial diffusion from ``start_sigma`` A.
 
-        Uses this session's embeddings, which should be equilibrium mode.
+        Uses this session's embeddings, which should be equilibrium mode; no dynamics
+        conditioning (see ``sample_from_template_with_embeddings``).
         """
         if self.mode != "equilibrium":
             logger.warning(
                 "Template sampling normally uses equilibrium embeddings; using mode=%s unchanged.",
                 self.mode,
             )
-        if not self.model.supports_propagation:
-            raise ValueError("The loaded checkpoint does not support propagation.")
-        configured_sampler = (
-            sampler_from_preset(sampler, mode="equilibrium")
-            if isinstance(sampler, str)
-            else sampler
+        configured = (
+            sampler_from_preset(sampler, mode=self.mode) if isinstance(sampler, str) else sampler
         )
+        if not isinstance(configured, EDMSampler | GuidedFKSampler):
+            raise ValueError("Template sampling supports EDMSampler and GuidedFKSampler.")
         return sample_from_template_with_embeddings(
             self.system,
             self._get_embedding(),
             template=template,
-            num_samples=num_samples,
-            lag_time_ns=lag_time_ns,
-            max_lag_time_ns=max_lag_time_ns,
+            start_sigma=start_sigma,
             model=self.model,
+            num_samples=num_samples,
             batch_size=batch_size,
-            sampler=configured_sampler,
+            sampler=configured,
             seed=seed,
             progress=progress,
         )

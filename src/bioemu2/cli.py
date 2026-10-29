@@ -26,23 +26,20 @@ from bioemu2.denoising.steering.potentials import Potential
 from bioemu2.model import load_model
 from bioemu2.msa.alignment import get_msa
 from bioemu2.physicality import PhysicalityFilterMode, PhysicalityReport
-from bioemu2.propagation import (
-    propagate,
-    propagate_with_embeddings,
-    sample_from_template_with_embeddings,
-)
+from bioemu2.propagation import propagate, propagate_with_embeddings
 from bioemu2.sampling import (
     SamplerPreset,
     check_physicality,
     expected_extra_bonds_from_system,
     predict_structure,
     sample_equilibrium,
+    sample_from_template_with_embeddings,
     sampler_from_preset,
     save_topology_cif,
     write_sampling_system,
 )
 from bioemu2.structure import AllAtomStructure
-from bioemu2.trajectory_io import map_cif_atom_order
+from bioemu2.trajectory_io import map_cif_atom_order, save_frames
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +245,7 @@ def _write_propagation_output(
     system: System,
     *,
     x0: mdtraj.Trajectory,
-    lag_time_ns: float | np.ndarray,
+    lag_time_ns: float,
     out: Path,
     endpoints: mdtraj.Trajectory,
     contacts: list[Contact] | None = None,
@@ -275,9 +272,7 @@ def _write_propagation_output(
         checked = report.checked
         passes_checks[start : start + chunk.n_frames] = report.passed
         reasons.extend(report.reasons)
-    endpoints.time = np.broadcast_to(
-        np.asarray(lag_time_ns, dtype=np.float64) * 1000.0, (endpoints.n_frames,)
-    ).copy()
+    endpoints.time = np.full(endpoints.n_frames, lag_time_ns * 1000.0)
     endpoints.save_xtc(str(out / "samples.xtc"))
     _write_physicality_report(passes_checks, reasons, physicality_filter, out, checked)
     if not checked:
@@ -374,25 +369,18 @@ def convert_boltz_command(source: Path, out: Path) -> None:
     "--template-cif",
     type=click.Path(path_type=Path, dir_okay=False, exists=True),
     metavar="CIF",
-    help="Template mode: condition every sample on this structure through the propagation "
-    "pathway (its atoms must match the system). Without --system or --pdb-id, the system "
-    "is inferred from the CIF.",
+    help="Template mode: start every sample from this structure noised to --template-sigma "
+    "and denoise with the equilibrium model (partial diffusion; no dynamics conditioning). "
+    "Its atoms must match the system; without --system or --pdb-id, the system is inferred.",
 )
 @click.option(
-    "--template-lag-ns",
+    "--template-sigma",
     type=click.FloatRange(min=0, min_open=True),
-    default=1000.0,
+    default=20.0,
     show_default=True,
-    metavar="T",
-    help="Template mode: the lag, or the shortest lag with --template-max-lag-ns. Short lags "
-    "stay near the template; beyond a few milliseconds the template is effectively ignored.",
-)
-@click.option(
-    "--template-max-lag-ns",
-    type=click.FloatRange(min=0, min_open=True),
-    metavar="T",
-    help="Template mode: draw each sample's lag log-uniformly from --template-lag-ns to T "
-    "(needs a sampler without resampling: edm or edm_gd).",
+    metavar="ANGSTROM",
+    help="Template mode: starting noise level. Small values stay near the template; the "
+    "full schedule starts at 2560 A, which is ordinary equilibrium sampling.",
 )
 @click.option(
     "--msa",
@@ -405,8 +393,7 @@ def convert_boltz_command(source: Path, out: Path) -> None:
 def sample_equilibrium_command(
     num_samples: int,
     template_cif: Path | None,
-    template_lag_ns: float,
-    template_max_lag_ns: float | None,
+    template_sigma: float,
     msa_files: tuple[str, ...],
     system: Path | None,
     pdb_id: str | None,
@@ -424,30 +411,51 @@ def sample_equilibrium_command(
     compile_denoiser: bool,
     matmul_precision: str | None,
 ) -> None:
-    """Sample the equilibrium ensemble, optionally conditioned on a template structure."""
+    """Sample the equilibrium ensemble, optionally around a template structure."""
     if template_cif is not None:
-        _sample_from_template_command(
-            template_cif=template_cif,
-            lag_time_ns=template_lag_ns,
-            max_lag_time_ns=template_max_lag_ns,
-            msa_files=msa_files,
-            num_samples=num_samples,
+        if sampler not in ("edm", "edm_gd"):
+            raise click.UsageError("--template-cif supports --sampler edm or edm_gd.")
+        resolved_system, contacts, resolved_checkpoint = _resolve_common(
             system=system,
             pdb_id=pdb_id,
             checkpoint=checkpoint,
             checkpoint_path=checkpoint_path,
             checkpoint_cache_dir=checkpoint_cache_dir,
-            out=out,
-            batch_size=batch_size,
-            seed=seed,
-            num_steps=num_steps,
-            sampler=sampler,
-            potentials=potentials,
+            x0_cif=template_cif,
+        )
+        template = validate_x0(map_cif_atom_order(resolved_system, template_cif), resolved_system)
+        sources = {}
+        for item in msa_files:
+            chain, sep, path = item.partition("=")
+            if not sep or not chain or not path:
+                raise click.UsageError(f"--msa expects CHAIN=A3M, got {item!r}.")
+            sources[chain] = Path(path)
+        msa = get_msa(resolved_system, source=sources) if sources else get_msa(resolved_system)
+        resolved_sampler = _sampler(sampler, potentials)
+        if num_steps is not None:
+            resolved_sampler.num_steps = num_steps
+        _write_command(out)
+        model = load_model(
+            checkpoint=resolved_checkpoint,
+            checkpoint_path=checkpoint_path,
+            cache_dir=checkpoint_cache_dir,
             precision=precision,
-            physicality_filter=physicality_filter,
             compile_denoiser=compile_denoiser,
             matmul_precision=matmul_precision,
         )
+        samples = sample_from_template_with_embeddings(
+            resolved_system,
+            model.embed(resolved_system, msa=msa, mode="equilibrium", contacts=contacts),
+            template=template,
+            start_sigma=template_sigma,
+            model=model,
+            num_samples=num_samples,
+            batch_size=batch_size,
+            sampler=resolved_sampler,  # type: ignore[arg-type]
+            seed=seed,
+        )
+        physicality = check_physicality(samples, physicality_filter, system=resolved_system)
+        save_frames(samples, out, physicality=physicality)
         return
     if msa_files:
         raise click.UsageError("--msa is only used in template mode (--template-cif).")
@@ -480,84 +488,6 @@ def sample_equilibrium_command(
         seed=seed,
         output_dir=out,
         physicality_mode=physicality_filter,
-    )
-
-
-def _sample_from_template_command(
-    *,
-    template_cif: Path,
-    lag_time_ns: float,
-    max_lag_time_ns: float | None,
-    msa_files: tuple[str, ...],
-    num_samples: int,
-    system: Path | None,
-    pdb_id: str | None,
-    checkpoint: str | None,
-    checkpoint_path: Path | None,
-    checkpoint_cache_dir: Path | None,
-    out: Path,
-    batch_size: int | None,
-    seed: int | None,
-    num_steps: int | None,
-    sampler: str,
-    potentials: Path | None,
-    precision: str,
-    physicality_filter: str,
-    compile_denoiser: bool,
-    matmul_precision: str | None,
-) -> None:
-    """``sample-equilibrium --template-cif``: write samples.xtc with each sample's lag as its time."""
-    if max_lag_time_ns is not None and max_lag_time_ns < lag_time_ns:
-        raise click.UsageError("--template-max-lag-ns must be at least --template-lag-ns.")
-    resolved_system, contacts, resolved_checkpoint = _resolve_common(
-        system=system,
-        pdb_id=pdb_id,
-        checkpoint=checkpoint,
-        checkpoint_path=checkpoint_path,
-        checkpoint_cache_dir=checkpoint_cache_dir,
-        x0_cif=template_cif,
-    )
-    template = validate_x0(map_cif_atom_order(resolved_system, template_cif), resolved_system)
-    sources = {}
-    for item in msa_files:
-        chain, sep, path = item.partition("=")
-        if not sep or not chain or not path:
-            raise click.UsageError(f"--msa expects CHAIN=A3M, got {item!r}.")
-        sources[chain] = Path(path)
-    msa = get_msa(resolved_system, source=sources) if sources else get_msa(resolved_system)
-    resolved_sampler = _sampler(sampler, potentials)
-    if num_steps is not None:
-        resolved_sampler.num_steps = num_steps
-    _write_command(out)
-    model = load_model(
-        checkpoint=resolved_checkpoint,
-        checkpoint_path=checkpoint_path,
-        cache_dir=checkpoint_cache_dir,
-        precision=precision,
-        compile_denoiser=compile_denoiser,
-        matmul_precision=matmul_precision,
-    )
-    trunk_embeddings = model.embed(resolved_system, msa=msa, mode="equilibrium", contacts=contacts)
-    samples = sample_from_template_with_embeddings(
-        resolved_system,
-        trunk_embeddings,
-        template=template,
-        num_samples=num_samples,
-        lag_time_ns=lag_time_ns,
-        max_lag_time_ns=max_lag_time_ns,
-        model=model,
-        batch_size=batch_size,
-        sampler=resolved_sampler,
-        seed=seed,
-    )
-    _write_propagation_output(
-        resolved_system,
-        x0=template,
-        lag_time_ns=samples.time / 1000.0,
-        out=out,
-        endpoints=samples,
-        contacts=contacts,
-        physicality_filter=PhysicalityFilterMode(physicality_filter),
     )
 
 

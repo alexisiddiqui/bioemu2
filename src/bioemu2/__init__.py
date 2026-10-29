@@ -34,8 +34,6 @@ from bioemu2.propagation import (
     join_trajectory_steps,
     propagate,
     propagate_with_embeddings,
-    sample_equilibrium_from_template,
-    sample_from_template_with_embeddings,
     simulate_trajectory,
     simulate_trajectory_with_embeddings,
 )
@@ -43,6 +41,8 @@ from bioemu2.sampling import (
     check_physicality,
     predict_structure,
     sample_equilibrium,
+    sample_equilibrium_from_template,
+    sample_from_template_with_embeddings,
     sample_with_embeddings,
 )
 from bioemu2.trajectory_io import map_cif_atom_order, save_frames

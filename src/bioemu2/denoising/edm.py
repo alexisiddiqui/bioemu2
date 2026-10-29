@@ -61,6 +61,34 @@ def edm_sample_schedule(
     return sigmas
 
 
+def truncate_schedule(sigmas: torch.Tensor, start_sigma: float | None) -> torch.Tensor:
+    """Partial diffusion: keep the noise levels at or below ``start_sigma`` (angstroms).
+
+    Sampling then starts from a template noised to the first kept level instead of from
+    pure noise. ``None`` keeps the full schedule.
+    """
+    if start_sigma is None:
+        return sigmas
+    if not math.isfinite(start_sigma) or start_sigma <= 0:
+        raise ValueError("start_sigma must be finite and positive.")
+    kept = sigmas[sigmas <= start_sigma]
+    if len(kept) < 2:
+        raise ValueError(
+            f"start_sigma={start_sigma} A is below every denoising step but the last; raise it "
+            "or increase num_steps."
+        )
+    return kept
+
+
+def initial_coords(
+    batch_coords: torch.Tensor, sigma0: torch.Tensor, start_sigma: float | None, randn
+) -> torch.Tensor:
+    """Initial denoising coordinates: pure noise, or with ``start_sigma`` the template in
+    ``batch_coords`` (centred, angstroms) plus noise at the first kept level."""
+    noise = sigma0 * randn(batch_coords.shape, device=batch_coords.device, dtype=batch_coords.dtype)
+    return noise if start_sigma is None else batch_coords + noise
+
+
 def edm_sampler(
     *,
     batch: BatchAllAtomStructure,
@@ -74,6 +102,7 @@ def edm_sampler(
     gamma_min: float = 1.0,
     multiplicity: int = 1,
     alignment_reverse_diff: bool = True,
+    start_sigma: float | None = None,
 ) -> BatchAllAtomStructure:
     """Sample from the score model using the EDM schedule and Heun sampler of Karras et al.
 
@@ -92,6 +121,8 @@ def edm_sampler(
           operations.
         alignment_reverse_diff: Align noisy coordinates with denoised coordinates before Heun
           interpolation.
+        start_sigma: Partial diffusion from a template: start at this noise level (angstroms)
+          from ``batch.coords`` plus noise, running only the steps at or below it.
 
     Returns:
         Sampled structures.
@@ -115,6 +146,7 @@ def edm_sampler(
         rho=rho,
         device=device,
     )
+    sigmas = truncate_schedule(sigmas, start_sigma)
     gammas = torch.where(sigmas > gamma_min, gamma_0, 0.0)
     sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
 
@@ -124,10 +156,7 @@ def edm_sampler(
     batch = batch.replace(coords=broadcast_multiplicity(batch.coords, multiplicity))
 
     # Sample random initial atom positions.  Synchronize these over the CP group.
-    init_sigma = sigmas[0]
-    atom_coords = init_sigma * cp_sync.randn(
-        batch.coords.shape, device=device, dtype=batch.coords.dtype
-    )
+    atom_coords = initial_coords(batch.coords, sigmas[0], start_sigma, cp_sync.randn)
 
     cp_sync.barrier()
 

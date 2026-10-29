@@ -16,6 +16,8 @@ from bioemu2.denoising import cp_sync
 from bioemu2.denoising.augmentation import augment_coordinates
 from bioemu2.denoising.edm import (
     edm_sample_schedule,
+    initial_coords,
+    truncate_schedule,
 )
 from bioemu2.denoising.rigid_align import weighted_rigid_align
 from bioemu2.denoising.steering.conditioning import resample_conditioning
@@ -97,6 +99,7 @@ def edm_steered_sampler(
     num_gd_steps: int = 20,
     tracker: Tracker | None = None,
     denoise_micro_batch_size: int | None = None,
+    start_sigma: float | None = None,
 ) -> BatchAllAtomStructure:
     """Sample with EDM Heun updates and optional FK resampling and gradient guidance.
 
@@ -161,6 +164,7 @@ def edm_steered_sampler(
         rho=rho,
         device=device,
     )
+    sigmas = truncate_schedule(sigmas, start_sigma)
     gammas = torch.where(sigmas > gamma_min, gamma_0, 0.0)
     pairs = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
 
@@ -180,9 +184,7 @@ def edm_steered_sampler(
 
     # CUDA RNG is not bit-identical across devices, so rank 0 generates initial
     # noise and broadcasts it during CP sampling.
-    atom_coords = sigmas[0] * cp_sync.randn(
-        batch.coords.shape, device=device, dtype=batch.coords.dtype
-    )
+    atom_coords = initial_coords(batch.coords, sigmas[0], start_sigma, cp_sync.randn)
     scaled_guidance_update = torch.zeros_like(atom_coords, dtype=torch.float32)
     energy_traj: list[torch.Tensor] = []
 

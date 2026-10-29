@@ -315,39 +315,3 @@ trajectories = join_trajectory_steps(step_frames, lag_time_ns=lag_time_ns)
 
 `join_trajectory_steps()` joins frame `i` from every element of `step_frames`
 and assigns frame times in picoseconds.
-
-## Sample an equilibrium ensemble around a template
-
-BioEmu2's trunk has no structural-template input; the dynamics conditioning of
-propagation is the route by which a structure enters the model.
-`sample_equilibrium_from_template()` uses it as a template for equilibrium
-sampling: it embeds the system in equilibrium mode (with the MSA you pass, for
-example a local alignment for a designed chain) and draws every sample as an
-endpoint conditioned on the template at its own lag. Short lags stay near the
-template; lags beyond a few milliseconds approach the unconditioned
-equilibrium ensemble. With `max_lag_time_ns`, each sample's lag is drawn
-log-uniformly between the two lags, and `trajectory.time` records it:
-
-```python
-from bioemu2 import get_msa, load_model, sample_equilibrium_from_template
-
-msa = get_msa(system, source={"A": Path("target.a3m"), "B": Path("binder.a3m")})
-samples = sample_equilibrium_from_template(
-    system,
-    model=load_model(),
-    template="designed_complex.cif",
-    num_samples=64,
-    lag_time_ns=10.0,
-    max_lag_time_ns=100_000.0,
-    msa=msa,
-    sampler="edm_gd",
-    seed=0,
-)
-```
-
-`EmuSession.sample_from_template()` does the same with a session's embeddings.
-On the command line, add `--template-cif`, `--template-lag-ns`,
-`--template-max-lag-ns` and, per protein chain, `--msa CHAIN=A3M` to
-`sample-equilibrium`. Samplers that resample particles (`edm_fk`, `edm_fkc`)
-need one fixed lag.
-
