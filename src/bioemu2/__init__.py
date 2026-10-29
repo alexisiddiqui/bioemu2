@@ -34,6 +34,8 @@ from bioemu2.propagation import (
     join_trajectory_steps,
     propagate,
     propagate_with_embeddings,
+    sample_equilibrium_from_template,
+    sample_from_template_with_embeddings,
     simulate_trajectory,
     simulate_trajectory_with_embeddings,
 )
@@ -79,6 +81,8 @@ __all__ = [
     "propagate",
     "propagate_with_embeddings",
     "sample_equilibrium",
+    "sample_equilibrium_from_template",
+    "sample_from_template_with_embeddings",
     "sample_with_embeddings",
     "simulate_trajectory",
     "simulate_trajectory_with_embeddings",
